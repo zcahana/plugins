@@ -130,6 +130,55 @@ func getMTU(deviceName string) (int, error) {
 	return link.Attrs().MTU, nil
 }
 
+// get the container interface on which we'll set up the tbf
+func getTargetInterface(interfaces []*current.Interface, containerIfName string, netns ns.NetNS) (*current.Interface, ns.NetNS, error) {
+	if len(interfaces) == 0 {
+		return nil, nil, fmt.Errorf("no interfaces provided")
+	}
+
+	// find the container interface and try to determine its type
+	var containerIf netlink.Link
+	var err error
+	_ = netns.Do(func(_ ns.NetNS) error {
+		containerIf, err = netlink.LinkByName(containerIfName)
+		return err
+	})
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("interface '%s' not found in container network namespace", containerIfName)
+	}
+
+	switch (containerIf.Type()) {
+
+	// in the case of macvlan/ipvlan plugins,
+	// there's no veth peer on the host, so we operate
+	// directly on the interface within the container's network namespace
+	case "macvlan", "ipvlan":
+		for _, iface := range interfaces {
+			if iface.Name == containerIfName && iface.Sandbox == netns.Path() {
+				return iface, netns, nil
+			}
+		}
+
+		return nil, nil, fmt.Errorf("container interface '%s' not found in CNI prevResult.interfaces", containerIfName)
+
+	// in the default case, we fallback to retrieving the
+	// veth peer of the container network interface
+	default:
+		hostIf, err := getHostInterface(interfaces, containerIfName, netns)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		hostNS, err := ns.GetCurrentNS()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return hostIf, hostNS, nil
+	}
+}
+
 // get the veth peer of container interface in host namespace
 func getHostInterface(interfaces []*current.Interface, containerIfName string, netns ns.NetNS) (*current.Interface, error) {
 	if len(interfaces) == 0 {
@@ -187,44 +236,55 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	hostInterface, err := getHostInterface(result.Interfaces, args.IfName, netns)
+	targetInterface, targetNS, err := getTargetInterface(result.Interfaces, args.IfName, netns)
 	if err != nil {
 		return err
 	}
 
-	if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
-		err = CreateIngressQdisc(bandwidth.IngressRate, bandwidth.IngressBurst, hostInterface.Name)
-		if err != nil {
-			return err
-		}
-	}
-
-	if bandwidth.EgressRate > 0 && bandwidth.EgressBurst > 0 {
-		mtu, err := getMTU(hostInterface.Name)
-		if err != nil {
-			return err
+	// Execute the rest of this within the target network namespace,
+	// whether its a container network namespace, or the host network namespace.
+	err = targetNS.Do(func(_ ns.NetNS) error {
+		if bandwidth.IngressRate > 0 && bandwidth.IngressBurst > 0 {
+			err = CreateIngressQdisc(bandwidth.IngressRate, bandwidth.IngressBurst, targetInterface.Name)
+			if err != nil {
+				return err
+			}
 		}
 
-		ifbDeviceName := getIfbDeviceName(conf.Name, args.ContainerID)
+		if bandwidth.EgressRate > 0 && bandwidth.EgressBurst > 0 {
+			mtu, err := getMTU(targetInterface.Name)
+			if err != nil {
+				return err
+			}
 
-		err = CreateIfb(ifbDeviceName, mtu)
-		if err != nil {
-			return err
+			ifbDeviceName := getIfbDeviceName(conf.Name, args.ContainerID)
+
+			err = CreateIfb(ifbDeviceName, mtu)
+			if err != nil {
+				return err
+			}
+
+			ifbDevice, err := netlink.LinkByName(ifbDeviceName)
+			if err != nil {
+				return err
+			}
+
+			result.Interfaces = append(result.Interfaces, &current.Interface{
+				Name: ifbDeviceName,
+				Mac:  ifbDevice.Attrs().HardwareAddr.String(),
+				Sandbox: targetNS.Path(),
+			})
+			err = CreateEgressQdisc(bandwidth.EgressRate, bandwidth.EgressBurst, targetInterface.Name, ifbDeviceName)
+			if err != nil {
+				return err
+			}
 		}
 
-		ifbDevice, err := netlink.LinkByName(ifbDeviceName)
-		if err != nil {
-			return err
-		}
+		return nil
+	})
 
-		result.Interfaces = append(result.Interfaces, &current.Interface{
-			Name: ifbDeviceName,
-			Mac:  ifbDevice.Attrs().HardwareAddr.String(),
-		})
-		err = CreateEgressQdisc(bandwidth.EgressRate, bandwidth.EgressBurst, hostInterface.Name, ifbDeviceName)
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 
 	return types.PrintResult(result, conf.CNIVersion)
