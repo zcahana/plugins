@@ -17,9 +17,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
-
 	"github.com/vishvananda/netlink"
+	"math"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -131,7 +130,7 @@ func getMTU(deviceName string) (int, error) {
 }
 
 // get the container interface on which we'll set up the tbf
-func getTargetInterface(interfaces []*current.Interface, containerIfName string, netns ns.NetNS) (*current.Interface, ns.NetNS, error) {
+func getTargetInterface(interfaces []*current.Interface, containerIfName string, containerNS, hostNS ns.NetNS) (*current.Interface, ns.NetNS, error) {
 	if len(interfaces) == 0 {
 		return nil, nil, fmt.Errorf("no interfaces provided")
 	}
@@ -139,7 +138,7 @@ func getTargetInterface(interfaces []*current.Interface, containerIfName string,
 	// find the container interface and try to determine its type
 	var containerIf netlink.Link
 	var err error
-	_ = netns.Do(func(_ ns.NetNS) error {
+	_ = containerNS.Do(func(_ ns.NetNS) error {
 		containerIf, err = netlink.LinkByName(containerIfName)
 		return err
 	})
@@ -155,8 +154,8 @@ func getTargetInterface(interfaces []*current.Interface, containerIfName string,
 	// directly on the interface within the container's network namespace
 	case "macvlan", "ipvlan":
 		for _, iface := range interfaces {
-			if iface.Name == containerIfName && iface.Sandbox == netns.Path() {
-				return iface, netns, nil
+			if iface.Name == containerIfName && iface.Sandbox == containerNS.Path() {
+				return iface, containerNS, nil
 			}
 		}
 
@@ -165,12 +164,7 @@ func getTargetInterface(interfaces []*current.Interface, containerIfName string,
 	// in the default case, we fallback to retrieving the
 	// veth peer of the container network interface
 	default:
-		hostIf, err := getHostInterface(interfaces, containerIfName, netns)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		hostNS, err := ns.GetCurrentNS()
+		hostIf, err := getHostInterface(interfaces, containerIfName, containerNS)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -230,13 +224,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("could not convert result to current version: %v", err)
 	}
 
-	netns, err := ns.GetNS(args.Netns)
+	containerNS, err := ns.GetNS(args.Netns)
 	if err != nil {
-		return fmt.Errorf("failed to open netns %q: %v", netns, err)
+		return fmt.Errorf("failed to open network namespace %q: %v", containerNS, err)
 	}
-	defer netns.Close()
+	defer containerNS.Close()
 
-	targetInterface, targetNS, err := getTargetInterface(result.Interfaces, args.IfName, netns)
+	hostNS, err := ns.GetCurrentNS()
+	if err != nil {
+		return fmt.Errorf("failed to open network namespace %q: %v", containerNS, err)
+	}
+	defer hostNS.Close()
+
+	targetInterface, targetNS, err := getTargetInterface(result.Interfaces, args.IfName, containerNS, hostNS)
 	if err != nil {
 		return err
 	}
@@ -269,14 +269,27 @@ func cmdAdd(args *skel.CmdArgs) error {
 				return err
 			}
 
-			result.Interfaces = append(result.Interfaces, &current.Interface{
-				Name: ifbDeviceName,
-				Mac:  ifbDevice.Attrs().HardwareAddr.String(),
+			ifbInterface := &current.Interface{
+				Name:    ifbDeviceName,
+				Mac:     ifbDevice.Attrs().HardwareAddr.String(),
 				Sandbox: targetNS.Path(),
-			})
+			}
+			result.Interfaces = append(result.Interfaces, ifbInterface)
+
 			err = CreateEgressQdisc(bandwidth.EgressRate, bandwidth.EgressBurst, targetInterface.Name, ifbDeviceName)
 			if err != nil {
 				return err
+			}
+
+			// If the IFB device was created in the container namespace,
+			// move it to the host network namespace
+			if targetNS == containerNS {
+				err := netlink.LinkSetNsFd(ifbDevice, int(hostNS.Fd()))
+				if err != nil {
+					return err
+				}
+
+				ifbInterface.Sandbox = hostNS.Path()
 			}
 		}
 
